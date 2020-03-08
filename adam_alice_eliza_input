@@ -1,0 +1,393 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Dec 21 13:49:08 2019
+
+@author: Nate
+"""
+
+
+#%%
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+import copy as copy
+from sklearn import svm
+import random as random
+import urllib.request
+import datetime
+import pickle
+
+### Custom. stock_models has a dependency on the custom script core.py, written by Michael Tro and originally adapted from a tutorial on variational autoencoders
+### provided by keras.
+
+import stock_models as SM
+from stock_models import data_set
+from stock_models import stock_day
+from stock_models import stock_list
+#%%
+### The goal of this script is to run the ADAM and ALICE approaches to predicting whether tomorrow's stock will grow (1) or fall (0).
+### It should be noted ADAM and ALICE were names chosen randomly, and refer mainly to how the data is prepared. Both models use the same original input
+### variables, which are described in the data_set class definition of stock_models.py and common measures applied to stock time series.
+### The script also allows the ELIZA approach which, in addition to taking an extremely long time, doesn't perform terribly well. It's a work in progress.
+input_features = ['close','%k', '%D', 'slow%D', 'momentum', 'ROC', '%R', 'AD', '5Mu', '10Mu', 'OSCP', 'cci', 'rsi']
+target_values = ['future_class']
+# I/O and Specification
+## The portfolio of stock indices
+portfolio = ['F']
+## The first date considered. Must be available for all stock indices in the portfolio.
+start_date = "2013-01-01"
+## The path to which you will download your stock history. This directory must be configured. The script will not create it for you.
+path = 'D:/projects/project-0_skunk/data/nasdaq/'
+### The minimal MCC threshold a SVM must achieve to terminate the searching process. It will otherwise perform a grid search
+termination_accuracy = 0.65
+### The area of the grid search for gamma and C. Should be a square integer, as the grid will be partitioned using the remaining lines in this section.
+number_attempts = 900
+#
+root = int(number_attempts**(1/2))
+C_candidates = np.arange(0.1,10.1,(10/root))
+gamma_candidates = np.arange(0.001, 1000.001, (1000/root))
+### The list of oracles to consult on the portfolio. Right now, only ADAM and ALICE approaches are working. ELIZA is a work in progress.
+oracles = ['ADAM', 'ALICE', 'ELIZA']
+###### Initialize system information
+now = datetime.datetime.now()
+if len(str(now.day)) == 1:
+    tday = '0'+str(now.day)
+if len(str(now.month)) == 1:
+    tmonth = '0'+str(now.month)
+today = str(now.year)+"-"+str(tmonth)+"-"+str(tday)
+### I/O
+try:
+    divine_history = pickle.load(open(path+"predictions.pkl", "rb"))
+except:
+    divine_history = {}
+###
+try:
+    yesterday = [*divine_history][-1]
+except:
+    pass
+compute_yesterday = 'N'
+### Define the distance to look into the past. 10 was a value I saw, however 14 is also conventional.
+past_len = 10
+##### Number of LSTMs ELIZA will train. From my initial tests the trainings take a very long time, so I suggest this be a small number.
+ann_count = 1
+
+
+#####
+Oracle_Preds = []
+#####
+
+#%%
+############# This helper function performs the conversion of binary class notation for the ann code and the svm code
+def help_ann2svm(value):
+    if value[0][0] > value[0][1]:
+        return [0]
+    else:
+        return [1]
+#############
+        
+deltas = []
+del_flag = 0
+divinations = {"ADAM" : {}, "ALICE" : {}, "ELIZA" : {}}
+for ora in oracles:
+    Oracle_Preds.append([])
+    print("Oracle "+str(ora))
+    for stock_i in portfolio:
+        print("Let's look at "+stock_i+" now.")
+        ### Input Script Section
+        symbol = stock_i
+        file_name = symbol+'_recent.csv'                   
+        ### Data Preparation          
+        url = "https://www.nasdaq.com/api/v1/historical/"+symbol+"/stocks/"+start_date+"/"+today+"/"
+        print("Retrieving most recent stock data from: "+url+" | Saving file as: "+path+'/data_files/'+file_name)
+        urllib.request.urlretrieve(url, path+'/data_files/'+file_name)
+        print("Data downloaded. Beginning prediction.")
+        ### Pandas process NASDAQ csv. This part is contingent upon the NASDAQ csv distribution maintaining the convention as of 3/4/2020.    
+        reversed_df = pd.read_csv(path+'/data_files/'+file_name)        
+        df = reversed_df.iloc[::-1]       
+        headers = ['Date', ' Close/Last', ' Volume', ' Open', ' High', ' Low']
+        
+        for i in [' Close/Last', ' Open', ' High', ' Low']:
+            df[i] = df[i].str.replace('$','')
+        
+        stock_data = []
+
+        ### Read raw data into attribute dictionary        
+        for i in range(df.shape[0]):
+            att = { 'index' : (df.shape[0] - i - 1), 'date' : df.at[i, 'Date'], 'close' : float(df.at[i, ' Close/Last']), 'volume' : float(df.at[i, ' Volume']), 
+                   'open' : float(df.at[i, ' Open']), 'high' : float(df.at[i, ' High']), 'low' : float(df.at[i, ' Low'])}
+            stock_data.append(stock_day(att))
+        
+        stock_data.reverse()
+        ### Initialize data                    
+        sl = stock_list(stock_data)
+        sl.initialize_past(past_len)
+        sl.initialize_metrics(past_len)
+        prod_data = sl.return_production(past_len)
+        x = []
+        y = []
+        XYdata = []        
+        ################################ This helper function should be self-explanatory
+        def helper_int2vec(integer):
+            if integer == [0]:
+                return np.asarray([1,0])
+            elif integer == [1]:
+                return np.asarray([0,1])
+            else:
+                pass
+        ################################
+        ##### Oracle Definitions
+        ##### ADAM, ELIZA and ALICE boil down to a difference in approaches regarding the methods of data preparation they use
+        ##### built into the same data_set class of stock_models.py. Thus, the way I use them is through this admittedly clunky 
+        ##### input script. I may turn them into their own class like they probably should be, but it is a work in progress.
+            
+#%%
+        if ora == "ADAM":        
+        ### ADAM is the most basic approach. He normalizes the data, then performs a singular value decomposition and eliminates the half with the most
+        ### minor eigenvalues, leaving only the top half as principle components. He then estimates (and plots) the Hurst coefficient (see stock_models.py!)
+        ### of the six remaining variables, and trains his SVMs on that data.              
+       
+            for i in range(len(prod_data)):
+                XYdata.append([])
+                for j in input_features:
+                    XYdata[-1].append(prod_data[i].atts[j])
+                for j in target_values:
+                    XYdata[-1].append(prod_data[i].atts[j])                                
+            TodayX = [sl.data[-1].atts[i] for i in input_features]          
+            for i in range(len(XYdata)):
+                x.append(XYdata[i][0:len(input_features)])
+                y.append(XYdata[i][len(input_features):len(XYdata[i])][0])                
+            X = np.asarray(x)
+            Y = np.asarray(y)                   
+            print("Reducing dimensionality by "+str(int(len(x[0])/2)))
+            production = data_set(X,Y)
+            production.normalize()
+            production.svd(degree = int(len(x[0])/2), plot = "Y")
+            production.Calc_Hurst(plot='Y')
+            X_train, Y_train, X_test, Y_test = production.test_and_train(0.7)            
+#%%            
+        if ora == "ALICE":
+        ### ALICE is similar to ADAM, however she uses a stacked autoencoder to pre-process her data (after SVD) before training the SVMs. She seems
+        ### To perform the best.
+          
+            for i in range(len(prod_data)):
+                XYdata.append([])
+                for j in input_features:
+                    XYdata[-1].append(prod_data[i].atts[j])
+                for j in target_values:
+                    XYdata[-1].append(prod_data[i].atts[j])
+            TodayX = [sl.data[-1].atts[i] for i in input_features]            
+            for i in range(len(XYdata)):
+                x.append(XYdata[i][0:len(input_features)])
+                y.append(XYdata[i][len(input_features):len(XYdata[i])][0])                
+            X = np.asarray(x)
+            Y = np.asarray(y)                   
+            production = data_set(X,Y)
+            production.normalize()
+            production.svd(degree = int(len(x[0])/2), plot = "Y")
+            production.autoencode(plot='Y', divisor=2, epochs=500, path=path+"/figures/"+ora+"_"+str(symbol)+"_"+today+"-"+str(now.day)+"encoded.png")
+            production.encoded_data.normalize()
+            production.encoded_data.Calc_Hurst(plot='Y')
+            X_train, Y_train, X_test, Y_test = production.encoded_data.test_and_train(0.7)
+#%%            
+        if ora == "ELIZA":   
+        ### ELIZA differs in that she does not use a SVM classifier but instead uses an LSTM on data preprocessed using the
+        ### ALICE protocol. ELIZA's performance is currently dreadful. She's a work in progress.
+            
+            for i in range(len(prod_data)):
+                XYdata.append([])
+                for j in input_features:
+                    XYdata[-1].append(prod_data[i].atts[j])
+                for j in target_values:
+                    XYdata[-1].append(prod_data[i].atts[j])
+                                    
+            TodayX = [sl.data[-1].atts[i] for i in input_features]
+                        
+            for i in range(len(XYdata)):
+                x.append(XYdata[i][0:len(input_features)])
+                y.append(XYdata[i][len(input_features):len(XYdata[i])][0])
+                
+            X = np.asarray(x)
+            Y = np.asarray(y)       
+            
+            production = data_set(X,Y)
+            production.normalize()
+            production.Calc_Hurst(plot='Y')
+            production.svd(degree = int(len(x[0])/2), plot = "Y")
+            production.autoencode(plot='Y', divisor=2, epochs=500, path=path+"/figures/"+ora+"_"+str(symbol)+"_"+today+"-"+str(now.day)+"-encoded.png")
+            production.encoded_data.normalize()
+            production.encoded_data.Calc_Hurst(plot='Y')
+            production.encoded_data.prepare_LSTM()
+            X_train, Y_train, X_test, Y_test = production.encoded_data.test_and_train(0.7)
+            #%%
+            ### Initialize inputs for current day
+            TodayX = np.asarray([production.autoencoder.encode(np.asarray([[sl.data[-j].atts[i] for i in input_features] for j in range(production.encoded_data.time_window,0,-1)]))])
+            
+            #%%
+            
+        acc = 0.0
+        count = 0
+        
+        
+        
+        Cs = []
+        gammas = []
+        accs = []
+        
+        ###############################
+        
+            
+        ######### Execution
+        acc = 0.0
+        fig2, ax2 = plt.subplots()
+        accs = []
+        mccs = []
+        models = []
+        count = 0
+        if ora == "ADAM" or ora == "ALICE":
+            for index_gamma in range(root):
+                for index_C in range(root):
+                    C = C_candidates[index_C]
+                    gamma = gamma_candidates[index_gamma]
+                    model = SM.stock_SVM(X_train, Y_train, X_test, Y_test, count, C, gamma)
+                    model.metrics()       
+                    count += 1
+                    Cs.append(C)
+                    gammas.append(gamma)
+                    accs.append(model.acc)
+                    acc = model.acc
+                    models.append(model)
+                    mccs.append(model.MCC)                     
+                    ax2.set_xlabel("Cs")
+                    ax2.set_ylabel("Gammas")
+                    ax2.set_title("Hyperparameters, White -> Better MCC")
+                    
+                    if count % int(number_attempts/5) == 0:
+                        print("Scanning..."+str((count/number_attempts)*100)+"%")
+                        plt.scatter(Cs, gammas, c=mccs, s=5)
+                        plt.gray()   
+                        plt.ylim((0.0,1000))                        
+                        plt.show()
+            
+            plt.scatter(Cs, gammas, c=mccs, s=5)            
+            plt.savefig(path+"/figures/"+str(symbol)+"_"+ora+"_"+today+".png")            
+            models.sort(key=lambda x: x.MCC, reverse=True)
+            try:        
+                his = open(path+'histories/history-'+symbol+'-'+str(oracle_names[ora])+'-'+today+'.dat', 'w')
+                his.write("C,gamma,MCC\n") 
+                for i in range(len(Cs)):
+                    his.write(str(Cs[i])+","+str(gammas[i])+","+str(mccs[i])+"\n")
+                his.close
+            except:
+                print("No histories directory configured at "+path+"/histories/  | script will not record predictions to history file.")
+            print('C = '+str(models[0].C)+' | gamma = '+str(models[0].gamma))
+            
+        
+        if ora == "ADAM":
+            prediction = models[0].predict([TodayX])
+        if ora == "ALICE":     
+            prediction = models[0].predict(production.autoencoder.encode(np.asarray([TodayX])))            
+        if ora == "ELIZA":
+            while acc < termination_accuracy:
+                print('Computing...'+str(round((count-1)/(ann_count+1),2)*100)+'%')
+                if count > ann_count:
+                    print('I have done my best...')
+                    break
+                else:
+                    model = SM.stock_LSTM(X_train, Y_train, epochs = 10000, plot = 'Y')
+                    model.metrics(X_test, Y_test, plot = 'Y')
+                    count += 1
+                    accs.append(model.acc)
+                    acc = model.acc
+                    models.append(model)
+                    mccs.append(model.MCC)
+                if acc > termination_accuracy:
+                    print("Threshold Achieved")
+            
+            models.sort(key=lambda x: x.MCC, reverse=True)
+            
+            #%%
+        if ora == "ELIZA":
+            prediction = [models[0].ordain(TodayX)]
+            #%%
+             
+            ### Need to update how ANN histories are printed
+            try: 
+                his = open(path+'histories/history-'+symbol+'-'+oracle_names[ora]+'-'+today+'.dat', 'w')
+                his.write("arch,MCC\n") 
+                for i in range(len(mccs)):
+                    his.write(str(models[0].arch)+","+str(mccs[i])+"\n")
+                his.close
+            except:
+                pass
+            
+                        ##############
+                    
+        if ora == "ADAM":
+            prediction = models[0].model.predict(np.asarray([TodayX]))
+        if ora == "ALICE":
+            prediction = models[0].model.predict(production.autoencoder.encode(np.asarray([TodayX])))
+
+        ############## Simple helper function
+        
+        def helper_class2eng(value):
+            if value == [0]:
+                return "LOSS"
+            if value == [1]:
+                return "GAIN"
+        
+        ####################
+            
+        fout = open(path+"prediction_summary.dat", 'a')
+        fout.write("####### " +today+" ####### \n")
+        fout.write("Oracle "+str(ora)+" prediction for "+symbol+"\n")
+        fout.write("Accuracy " + str(models[0].acc)+"\n")
+        fout.write("MCC "+str(models[0].MCC)+"\n")
+        fout.write("Tomorrow " + symbol +" " + "is predicted as " + str(helper_class2eng(prediction)+"\n"))
+        fout.close()
+        
+        print("Accuracy " + str(models[0].acc))
+        print("MCC "+str(models[0].MCC))
+        print("Tomorrow " + symbol +" " + "is predicted as " + str(helper_class2eng(prediction))+"\n")
+        print("\n")
+        
+        divinations[ora].update({symbol : prediction[0]})
+        
+        Oracle_Preds[-1].append([symbol, ora, today, str(models[0].MCC), helper_class2eng(prediction)])
+    del_flag = 1
+
+
+def transpose_lol(l):
+### transposes a list of lists that is two dimensional
+    lT = []
+    for index_j in range(len(l[0])):
+        lT.append([])
+        for index_i in range(len(l)):
+            lT[-1].append(0)
+    for index_i in range(len(l)):
+        for index_j in range(len(l[0])):
+            lT[index_j][index_i] = l[index_i][index_j]
+    return lT
+
+##############
+    
+Oracle_PredsT = transpose_lol(Oracle_Preds)
+fout = open(path+"portfolio_daily_summary.dat", "w")
+for i in Oracle_PredsT:
+    for j in i:
+        line = ''
+        for k in j:
+            line += str(k)+","
+        line += "\n"
+        fout.write(line)
+fout.close()
+
+pickle.dump(incomes, open(path+'incomes.p', "wb"))
+divine_history.update({today:divinations})
+pickle.dump(divine_history, open(path+"divination.p", "wb"))
+
+#%%
+    
+
+
+
+
